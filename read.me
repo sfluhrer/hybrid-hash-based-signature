@@ -1,0 +1,249 @@
+This package is a signature system; that is, it has a public and a private
+key, and someone with the private key can 'sign' a message, and someone with
+the public key can 'verify' the signature (that the message is exactly as
+originally signed), but with the public key, you cannot sign any other
+message.
+
+Sphincs+ is such a signature system; it has nice features, such that it is
+cryptographically as strong as the underlying hash function (in our case,
+SHA-256); if we assume that SHA-256 is invulnerable to Quantum Computers (as
+is generally believed), than Sphincs+ is as well.  This is a weaker security
+assumption than any non-hash-based signature method (which generally depends
+on both the strength of the hash function and some other security assumption).
+(Note for noncryptographers: in this context, "weaker" is better).
+
+Now, Sphincs+ has a number of disadvantages, compared to other siganture
+methods:
+  - The signatures are large
+  - It takes a long time to generate a signature for a message
+
+Now, what this project does is try to address the second disadvantage; to
+have a system which is as strong as Sphincs+, but for which we can generate
+signatures quickly.
+
+Here is how it works: the have a stateful hash based signature 'below'
+the Sphincs+ signature.  When we start, we generate a random LMS public
+private key pair, and sign the public key with Sphincs+.  Then, we sign
+the actual message the user has with LMS, and generate as a signature
+the Sphincs+ signature of the LMS public key, the LMS public key, and
+the LMS signature of the message.
+
+This preserves the cryptographical strength of Sphincs+, because LMS
+also shares that property.  And, because generating LMS signatures is
+much faster, we significantly speed the signature process.  And, because
+the LMS signature and public key is relatively small compared to the
+Sphincs+ signature, we haven't increased the signature size that much.
+
+Now, obvious questions:
+
+- If LMS is so wonderful, why don't we just use that, and ignore
+  Sphincs+?
+  Well, LMS does have a drawback - the signer needs to track state.
+  If we have a long term LMS key (and that we expect to reuse even
+  if the signer reloads), then we need to keep that state in some
+  sort of persistent memory, and that's surprisingly tricky.
+  With this scheme, where we always pick a random LMS key on every
+  reload, we never have to save it, and so most issues of state go away.
+
+- Hmmmm, you said "most issues of state go away" - what are some issues
+  that don't?
+  Well, we still don't do well with VM Cloning (where the memory is also
+  copied) - because the state is in memory, and so duplicating that breaks
+  things.  In addition, if you are threading and multiple threads try to use
+  the same loaded key, well, that also breaks.  If you have multple threads,
+  you need to load the key once for each thread, and have each thread use its
+  own state (just remember to provide fresh randomness each time you load
+  the key).
+
+- Doesn't LMS have a bound on the number of signatures a single public
+  key can generate?  Doesn't that cause a problem when we run out?
+  Actually, no, that's not a problem.  One thing we do while generating
+  signatures is, in the background, we generate a fresh LMS key and Sphincs+
+  signature.  We make sure that the new LMS key is ready before the current
+  runs out.  We switch when the new key and signature is ready - by doing
+  this, we ensure that we never run out.  We divide the process of generating
+  a fresh LMS key and Sphincs+ signature into tens of thousands of steps, with
+  each step being fairly cheap; everytime we generate a signature, we perform
+  one of those steps.
+
+For the Sphincs+ piece, we currently use the Round 2 "SHA-256 192S Simple"
+parameter set.  For the LMS piece, we currently use either
+LMOTS_SHA256_N24_W2 or LMOTS_SHA256_N24_W4 (configurable; see tune.h),
+LMS_SHA256_M24_H20 and L=1 (one HSS level).
+
+How to use: there are four steps:
+
+- Step 1: Key Generation.  This generates a fresh public/private keypair.
+  You are expected to export the public key, while keeping the private
+  key someplace safe.  This is done by:
+
+  bool success = sh_keygen( 1, 192, 1, random_function,
+                            private_key, sizeof private_key, &len_private_key,
+                            public_key, sizeof public_key, &len_public_key );
+  where:
+    - 1, 192, 1 are fixed parameters that mean "SHA-256 192S".  These are
+      currently the only settings the code will accept.  Obvious question: if
+      they are fixed, why does the application specify them?  Well, when this
+      was originally written, it was envisioned that we'd be rather more
+      flexible in what Sphincs+ parameter set we would support (and we may
+      be in the future).  Now, this API was designed before the robust/simple
+      distinction in the NIST round 2 version of Sphincs+ (and the API was
+      never updated), and so that's not specified.
+    - random_function is a pointer to a function that returns random values
+         bool random_function( void *buffer, size_t size_buffer );
+      When called, this function is expected to fill buffer with size_buffer
+      random bytes and return true (or return false on an error).
+      We pass a function, rather than passing a random pool, to try to make
+      it harder to forget to initialize the pool to random values.
+    - private_key, sizeof private_key is the buffer (and its length) to hold
+      the generated private key.  Currently, the private key is always
+      100 (LEN_PRIVKEY_192) bytes long; hence the buffer needs to be that long.
+    - &len_private_key is where we place the length of the private key.
+      As I just mentioned, currently it's always 100; however that may change
+      in the future.
+    - public_key, sizeof public_key is the buffer (and its length) to hold
+      the generated public key.  Currently, the public key is always 52
+      (LEN_PUBKEY_192) bytes long; hence the buffer needs to be that long.
+    - &len_public_key is where we place the length of the public key.
+      As I just mentioned, currently it's always 52; however that may change
+      in the future.
+  This function just does a Sphincs+ key generation; it's pretty fast. 
+
+- Step 2: Key Loading.  Before you can use the private key, you need to load
+  it into memory.  You can do this either after the key generation, or when
+  your application restarts (and having read the private key into memory).
+  This process also generates the random LMS tree, and generates the initial
+  Sphincs+ signature of that LMS public key.  This is done by:
+
+    struct sh_signer *signer = sh_load_signer( private_key, random_function );,
+
+  where:
+    - private_key contains the private key created by sh_keygen
+    - random_function is a pointer to a function that returns random values
+  This malloc's the space for the signer, and initializes it, generating the
+  LMS tree and Sphincs+ signature.  This will take a while (a frew seconds).
+  Note that it is important that random_function return fresh randomness
+  (it's used to select the initator random LMS tree, and so repeating it would
+  be bad)
+
+- Step 3: Generating Signatures.  Once you have the private key loaded into
+  memory, you can now generate signatures.  This is done by:
+
+    bool success = sh_sign( signature_buffer, sizeof signature_buffer,
+                            signer, message_to_sign, sizeof message_to_sign );
+  where:
+    - signature_buffer is where the generated signature will be written
+    - sizeof signature_buffer is how long the above buffer is (and if it's
+      not long enough, we'll generate an error without writing.  The length
+      is either 18860 or 20060 bytes (depending on configurable parameters;
+      see tune.h); the function sh_sig_len(signer) will return the required
+      buffer length
+    - signer is the structure you got from sh_load_signer
+    - message_to_sign, sizeof message_to_sign is the application message
+  This is fairly fast (less than a millisecond on my test platform)
+
+- Step 4: Verify the Signature.  When you have the public key, the message
+  and the claimed signature, you can check if the signature is valid by
+  calling:
+
+     bool valid = sh_verify( message, sizeof message,
+                             signature, sizeof signature, public_key )
+
+  where:
+    - message_to_sign, sizeof message_to_sign is the application message
+    - signature sizeof signature is the signature to test (which may or may
+      not have been generated by sh_sign for that specific message)
+    - public_key is the signer's public key
+
+Also, see tune.h for tweaks you can make for your platform.
+
+Another notable feature is configurable protection against fault attacks.
+In eprint 2018/102, Castelnovi et al shows that a single fault in a hash
+computation within Sphincs+ could potentially leak enough information to
+allow someone to forge signatures.  What this package does is allow the
+configurer to specify protections against this attack; if configured, this
+package will compute hash functions twice (and verify the derived WOTS+
+signatures to see if they are the same); in this fault attack, the two
+signatures will differ (and so we can detect the attack, and take action).
+Surprisingly enough, configuring this does not slow down generating
+signatures - the work done for a single step doesn't change, and that's
+what dictates the signature generation time.  What does change is the
+total number of steps taken to generate a fresh LMS/Sphincs+ signature;
+this means that the load time increases with this defense.
+
+Files included in this package:
+
+adr.[ch]                  Routines to work with the adr structure
+                          used within Sphincs+
+build_merkle.[ch]         Routine to incrementally build a Sphincs+
+                          merkle tree
+endian.[ch]               Routines to access multibyte memory in a
+                          platform-independent way
+hash.h                    Defines for the Sphincs+ hash functions
+                          (which we use only one)
+hmac.[ch]                 Our implementation of HMAC-SHA256
+hmac_drbg.[ch]            An implementation of the NIST HMAC-DRBG
+                          (except it doesn't include any KAT tests)
+keygen.c                  Routine that does a Sphincs+ public key
+                          generation
+lm_ots_common.[ch]        The LMS OTS routines (the common parts)
+lm_ots_param.h            The LMS OTS parameter set definitions
+lm_ots_sign.[ch]          The routines to generate LM OTS signatures
+                          and public keys
+lms_common_defs.h         Common definitions for the LMS routines
+lms_compute.[ch]          Routines to perform various comutations for
+                          LMS
+load.c                    Routine to load a hybrid sphincs private key
+                          into memory
+Makefile                  Simple make file for the test routine
+param.[ch]                Routine to look up the definition for the
+                          Sphincs+ hypertree.
+private_key_gen.[ch]      Routine to translate a secret seed value into the
+                          private values for the LMS, FORS and Sphincs+
+                          merkle leafs
+read.me                   You're reading it
+README                    Quick summary for github
+sha256.[ch]               Platform-independant version of SHA256 (in case
+                          OpenSSL isn't available)
+sh_signer.h               Include file that contains all the details of
+                          our internal signer data structures
+sign.c                    Code to actually does the signing operation
+sphincs_hash.[ch]         Implementation of the Sphincs+ F, H, thash functions
+sphincs-hybrid.h          External API for this package.
+step.c                    Code that implements the actual of performing one
+                          step to incrementally generate the next LMS key and
+                          Sphincs+ signature
+test.c                    Simple test to check the correctness and speed of
+                          this package
+tune.h                    Configurable parameters for this package - it was
+                          designed for you to tweak it
+verify.c                  Code to verify a hybrid siganture
+wots.[ch]                 Code to compute the WOTS+ checksum
+zeroize.[ch]              Code to erase a buffer
+
+
+Notes (and ideas for the future):
+
+- There are a whole bunch of configurable options in tune.h - when
+  you install, you probably want to go through to see what makes sense
+  in your application.
+
+- The (struct sh_signer) structure takes from 60k - 100k of memory
+  (depending on the configuration); we assume that this is not an
+  issue for the type of computers we expect this to run on.
+
+- There are no built-in regression tests in this package; there really
+  should be
+
+- Right now, it's fixed to 192 bit hashes (NIST Level 3; 18860 byte
+  or 20060 signatures).  We should support 128 bit hashes (NIST Level 1); this
+  would allow us to have about a 9k signature.
+
+- Should we also support Haraka (which is a supported Sphincs+ 'hash'
+  function)?  That would improve the load time, and possibly the signature
+  generation time (that's fast - it can always be faster).  The biggest issue
+  is that we'd want to use Haraka in LMS itself - it's not at all clear how
+  to do so.
+
+- We could try to take advantage of AVX-2 instructions; being able to
+  compute 8 hashes in parallel would be a nice speed-up.
